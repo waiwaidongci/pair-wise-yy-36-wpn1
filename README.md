@@ -28,11 +28,13 @@ python3 app.py --db ./data.db --port 8313
 - `GET /api/items`
 - `POST /api/items`
 - `GET /api/items/{id}`
-- `POST /api/items/{id}/records`
-- `POST /api/items/{id}/transition`，必须提交`expected_version`
+- `POST /api/items/{id}/records`，登记后记录保持待复核（open）
+- `POST /api/items/{id}/records/{rid}/review`，合规员提交`comment`和`expected_version`复核关闭；版本过旧或重复关闭返回409
+- `POST /api/items/{id}/signoff`，主任提交`comment`复查签署，每个事件仅一条
+- `POST /api/items/{id}/transition`，必须提交`expected_version`；归档（closed）还须提交`reason`
 - `GET /api/audit`
 
-允许角色：operator, compliance_officer, director, viewer。按浓度与许可限值计算超标倍数，异常读数先进入评估；关闭前必须没有未完成整改项。
+允许角色：operator, compliance_officer, director, viewer。按浓度与许可限值计算超标倍数，异常读数先进入评估；归档前必须所有整改记录已复核关闭、存在主任复查签署且审计链完整，否则返回409。登记、复核和归档均记录操作者、时间和原因。
 
 ## 测试
 

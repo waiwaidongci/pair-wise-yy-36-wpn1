@@ -49,10 +49,21 @@ class Repository:
                     detail TEXT NOT NULL,
                     status TEXT NOT NULL DEFAULT 'open'
                         CHECK(status IN ('open','closed')),
+                    version INTEGER NOT NULL DEFAULT 1,
+                    review_comment TEXT,
+                    reviewed_by TEXT,
+                    reviewed_at TEXT,
                     external_ref TEXT,
                     created_by TEXT NOT NULL,
                     created_at TEXT NOT NULL,
                     UNIQUE(item_id, external_ref)
+                );
+                CREATE TABLE IF NOT EXISTS signoffs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    item_id INTEGER NOT NULL UNIQUE REFERENCES items(id) ON DELETE CASCADE,
+                    comment TEXT NOT NULL,
+                    created_by TEXT NOT NULL,
+                    created_at TEXT NOT NULL
                 );
                 CREATE TABLE IF NOT EXISTS audit_events (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -66,6 +77,21 @@ class Repository:
                     created_at TEXT NOT NULL
                 );
             """)
+        self._migrate()
+
+    def _migrate(self) -> None:
+        with self._lock, self.conn:
+            columns = {row["name"] for row in
+                       self.conn.execute("PRAGMA table_info(records)").fetchall()}
+            additions = {
+                "version": "ALTER TABLE records ADD COLUMN version INTEGER NOT NULL DEFAULT 1",
+                "review_comment": "ALTER TABLE records ADD COLUMN review_comment TEXT",
+                "reviewed_by": "ALTER TABLE records ADD COLUMN reviewed_by TEXT",
+                "reviewed_at": "ALTER TABLE records ADD COLUMN reviewed_at TEXT",
+            }
+            for column, ddl in additions.items():
+                if column not in columns:
+                    self.conn.execute(ddl)
 
     @staticmethod
     def _item(row: sqlite3.Row) -> Dict[str, Any]:
@@ -156,6 +182,58 @@ class Repository:
                 (item_id,),
             ).fetchone()
         return int(row["n"])
+
+    def get_record(self, item_id: int, record_id: int) -> Dict[str, Any]:
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT * FROM records WHERE id=? AND item_id=?",
+                (record_id, item_id),
+            ).fetchone()
+        if row is None:
+            raise NotFoundError("记录不存在")
+        return dict(row)
+
+    def review_record(self, item_id: int, record_id: int, comment: str,
+                      expected_version: int, actor: str) -> Dict[str, Any]:
+        now = utc_now()
+        self.get_item(item_id)
+        with self._lock, self.conn:
+            cur = self.conn.execute(
+                """UPDATE records SET status='closed', version=version+1,
+                   review_comment=?, reviewed_by=?, reviewed_at=?
+                   WHERE id=? AND item_id=? AND version=? AND status='open'""",
+                (comment, actor, now, record_id, item_id, expected_version),
+            )
+            if cur.rowcount == 0:
+                exists = self.conn.execute(
+                    "SELECT 1 FROM records WHERE id=? AND item_id=?",
+                    (record_id, item_id),
+                ).fetchone()
+                if exists is None:
+                    raise NotFoundError("记录不存在")
+                raise ConflictError("记录已关闭或版本过旧，请刷新后重试")
+        return self.get_record(item_id, record_id)
+
+    def add_signoff(self, item_id: int, comment: str, actor: str) -> Dict[str, Any]:
+        now = utc_now()
+        self.get_item(item_id)
+        try:
+            with self._lock, self.conn:
+                self.conn.execute(
+                    """INSERT INTO signoffs(item_id, comment, created_by, created_at)
+                       VALUES(?,?,?,?)""",
+                    (item_id, comment, actor, now),
+                )
+        except sqlite3.IntegrityError as exc:
+            raise ConflictError("主任复查签署已存在，请刷新后查看") from exc
+        return self.get_signoff(item_id)
+
+    def get_signoff(self, item_id: int) -> Optional[Dict[str, Any]]:
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT * FROM signoffs WHERE item_id=?", (item_id,)
+            ).fetchone()
+        return dict(row) if row is not None else None
 
     def append_audit(self, action: str, entity_type: str, entity_id: int,
                      actor: str, detail: dict) -> Dict[str, Any]:
