@@ -28,11 +28,12 @@ python3 app.py --db ./data.db --port 8313
 - `GET /api/items`
 - `POST /api/items`
 - `GET /api/items/{id}`
-- `POST /api/items/{id}/records`
-- `POST /api/items/{id}/transition`，必须提交`expected_version`
+- `POST /api/items/{id}/records`：登记整改记录（保持待复核）；主任以`kind=director_signoff`新增唯一一条复查签署
+- `POST /api/items/{id}/records/{record_id}/review`：合规员提交`comment`与`expected_version`复核关闭记录
+- `POST /api/items/{id}/transition`，必须提交`expected_version`；归档（closed）还需提交`reason`
 - `GET /api/audit`
 
-允许角色：operator, compliance_officer, director, viewer。按浓度与许可限值计算超标倍数，异常读数先进入评估；关闭前必须没有未完成整改项。
+允许角色：operator, compliance_officer, director, viewer。按浓度与许可限值计算超标倍数，异常读数先进入评估；整改记录由合规员复核关闭，旧版本或重复关闭返回冲突；归档前必须所有记录已关闭、主任已签署且审计链完整，登记、复核和归档均记录操作者、时间与原因。
 
 ## 测试
 

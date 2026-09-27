@@ -2,12 +2,13 @@ from __future__ import annotations
 
 from typing import Any, Dict, Optional
 
-from .domain import ensure_role, normalize_severity, require_number, require_text
+from .domain import (ConflictError, NotFoundError, ValidationError, ensure_role,
+                     normalize_severity, require_number, require_text)
 from .repository import Repository
-from .rules import (AUDIT_ROLES, CREATE_ROLES, ENTITY, RECORD_ROLES, TITLE,
-                    VIEW_ROLES, completion_blockers, escalation_required,
-                    priority_score, response_deadline_hours, role_for_transition,
-                    validate_transition)
+from .rules import (AUDIT_ROLES, CREATE_ROLES, ENTITY, RECORD_ROLES, REVIEW_ROLES,
+                    SIGNOFF_KIND, SIGNOFF_ROLES, TERMINAL_STATES, TITLE, VIEW_ROLES,
+                    completion_blockers, escalation_required, priority_score,
+                    response_deadline_hours, role_for_transition, validate_transition)
 
 
 class Service:
@@ -38,41 +39,79 @@ class Service:
 
     def add_record(self, item_id: int, payload: Dict[str, Any], actor: str,
                    role: str) -> Dict[str, Any]:
-        ensure_role(role, RECORD_ROLES)
         actor = require_text(actor, "actor", 100)
         kind = require_text(payload.get("kind"), "kind", 100)
         detail = require_text(payload.get("detail"), "detail")
-        status = payload.get("status", "open")
-        if status not in ("open", "closed"):
-            raise ValueError("status必须是open或closed")
+        if kind == SIGNOFF_KIND:
+            ensure_role(role, SIGNOFF_ROLES)
+            status = "closed"
+            action = "signoff"
+        else:
+            ensure_role(role, RECORD_ROLES)
+            status = "pending_review"
+            action = "record"
         external_ref = payload.get("external_ref")
         if external_ref is not None:
             external_ref = require_text(external_ref, "external_ref", 100)
         record = self.repository.add_record(item_id, kind, detail, status,
                                             external_ref, actor)
-        self.repository.append_audit("record", ENTITY, item_id, actor, {
+        self.repository.append_audit(action, ENTITY, item_id, actor, {
             "record_id": record["id"], "kind": kind, "status": status,
+            "detail": detail,
         })
         return record
 
+    def review_record(self, item_id: int, record_id: int, payload: Dict[str, Any],
+                      actor: str, role: str) -> Dict[str, Any]:
+        ensure_role(role, REVIEW_ROLES)
+        actor = require_text(actor, "actor", 100)
+        comment = payload.get("comment")
+        if comment is None:
+            comment = payload.get("review_comment")
+        comment = require_text(comment, "comment")
+        expected_version = payload.get("expected_version")
+        if not isinstance(expected_version, int) or expected_version < 1:
+            raise ValidationError("expected_version必须是正整数")
+        record = self.repository.get_record(record_id)
+        if record["item_id"] != item_id:
+            raise NotFoundError("记录不存在")
+        updated = self.repository.review_record(record_id, comment,
+                                                expected_version, actor)
+        self.repository.append_audit("review", ENTITY, item_id, actor, {
+            "record_id": record_id, "comment": comment,
+        })
+        return updated
+
     def transition(self, item_id: int, target: str, expected_version: int,
-                   actor: str, role: str) -> Dict[str, Any]:
+                   actor: str, role: str, reason: Optional[str] = None) -> Dict[str, Any]:
         actor = require_text(actor, "actor", 100)
         item = self.repository.get_item(item_id)
         validate_transition(item["status"], target)
         ensure_role(role, role_for_transition(target))
         if not isinstance(expected_version, int) or expected_version < 1:
             raise ValueError("expected_version必须是正整数")
-        blockers = completion_blockers(target, self.repository.open_record_count(item_id))
+        if target in TERMINAL_STATES:
+            reason = require_text(reason, "reason", 500)
+            blockers = completion_blockers(
+                target, self.repository.open_record_count(item_id),
+                self.repository.has_signoff(item_id),
+                self.repository.verify_audit_chain())
+        else:
+            if reason is not None:
+                reason = require_text(reason, "reason", 500)
+            blockers = completion_blockers(
+                target, self.repository.open_record_count(item_id))
         if blockers:
-            from .domain import ConflictError
             raise ConflictError("；".join(blockers))
         updated = self.repository.transition_item(item_id, target, expected_version, actor)
-        self.repository.append_audit("transition", ENTITY, item_id, actor, {
+        detail = {
             "from": item["status"], "to": target,
             "escalation_required": escalation_required(
                 item["severity"], item["quantity"], item["threshold"]),
-        })
+        }
+        if reason is not None:
+            detail["reason"] = reason
+        self.repository.append_audit("transition", ENTITY, item_id, actor, detail)
         return self.enrich(updated)
 
     def get_item(self, item_id: int, role: str) -> Dict[str, Any]:

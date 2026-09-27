@@ -8,7 +8,7 @@ from typing import Any, Dict, List, Optional
 
 from .audit import make_entry, utc_now
 from .domain import ConflictError, NotFoundError
-from .rules import ID_PREFIX, STATES
+from .rules import ID_PREFIX, RECORD_STATUSES, SIGNOFF_KIND, STATES
 
 
 class Repository:
@@ -24,6 +24,8 @@ class Repository:
 
     def _create_schema(self) -> None:
         statuses = ",".join("'" + s.replace("'", "''") + "'" for s in STATES)
+        record_statuses = ",".join("'" + s.replace("'", "''") + "'" for s in RECORD_STATUSES)
+        signoff_kind = SIGNOFF_KIND.replace("'", "''")
         with self.conn:
             self.conn.executescript(f"""
                 CREATE TABLE IF NOT EXISTS items (
@@ -47,13 +49,19 @@ class Repository:
                     item_id INTEGER NOT NULL REFERENCES items(id) ON DELETE CASCADE,
                     kind TEXT NOT NULL,
                     detail TEXT NOT NULL,
-                    status TEXT NOT NULL DEFAULT 'open'
-                        CHECK(status IN ('open','closed')),
+                    status TEXT NOT NULL DEFAULT 'pending_review'
+                        CHECK(status IN ({record_statuses})),
+                    version INTEGER NOT NULL DEFAULT 1,
+                    review_comment TEXT,
+                    reviewed_by TEXT,
+                    reviewed_at TEXT,
                     external_ref TEXT,
                     created_by TEXT NOT NULL,
                     created_at TEXT NOT NULL,
                     UNIQUE(item_id, external_ref)
                 );
+                CREATE UNIQUE INDEX IF NOT EXISTS ux_records_signoff
+                    ON records(item_id) WHERE kind='{signoff_kind}';
                 CREATE TABLE IF NOT EXISTS audit_events (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     action TEXT NOT NULL,
@@ -129,6 +137,13 @@ class Repository:
         self.get_item(item_id)
         try:
             with self._lock, self.conn:
+                if kind == SIGNOFF_KIND:
+                    exists = self.conn.execute(
+                        "SELECT 1 FROM records WHERE item_id=? AND kind=?",
+                        (item_id, SIGNOFF_KIND),
+                    ).fetchone()
+                    if exists is not None:
+                        raise ConflictError("主任复查签署已存在")
                 cur = self.conn.execute(
                     """INSERT INTO records(item_id, kind, detail, status, external_ref,
                        created_by, created_at) VALUES(?,?,?,?,?,?,?)""",
@@ -136,10 +151,40 @@ class Repository:
                 )
                 record_id = int(cur.lastrowid)
         except sqlite3.IntegrityError as exc:
+            if "ux_records_signoff" in str(exc):
+                raise ConflictError("主任复查签署已存在") from exc
             raise ConflictError("记录唯一标识已存在") from exc
+        return self.get_record(record_id)
+
+    def get_record(self, record_id: int) -> Dict[str, Any]:
         with self._lock:
-            row = self.conn.execute("SELECT * FROM records WHERE id=?", (record_id,)).fetchone()
+            row = self.conn.execute(
+                "SELECT * FROM records WHERE id=?", (record_id,)
+            ).fetchone()
+        if row is None:
+            raise NotFoundError("记录不存在")
         return dict(row)
+
+    def review_record(self, record_id: int, comment: str, expected_version: int,
+                      actor: str) -> Dict[str, Any]:
+        now = utc_now()
+        with self._lock, self.conn:
+            cur = self.conn.execute(
+                """UPDATE records SET status='closed', review_comment=?, reviewed_by=?,
+                   reviewed_at=?, version=version+1
+                   WHERE id=? AND version=? AND status='pending_review'""",
+                (comment, actor, now, record_id, expected_version),
+            )
+            if cur.rowcount == 0:
+                row = self.conn.execute(
+                    "SELECT status FROM records WHERE id=?", (record_id,)
+                ).fetchone()
+                if row is None:
+                    raise NotFoundError("记录不存在")
+                if row["status"] == "closed":
+                    raise ConflictError("记录已关闭，请刷新后重试")
+                raise ConflictError("版本冲突，请刷新后重试")
+        return self.get_record(record_id)
 
     def list_records(self, item_id: int) -> List[Dict[str, Any]]:
         self.get_item(item_id)
@@ -152,10 +197,18 @@ class Repository:
     def open_record_count(self, item_id: int) -> int:
         with self._lock:
             row = self.conn.execute(
-                "SELECT COUNT(*) AS n FROM records WHERE item_id=? AND status='open'",
+                "SELECT COUNT(*) AS n FROM records WHERE item_id=? AND status<>'closed'",
                 (item_id,),
             ).fetchone()
         return int(row["n"])
+
+    def has_signoff(self, item_id: int) -> bool:
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT 1 FROM records WHERE item_id=? AND kind=? LIMIT 1",
+                (item_id, SIGNOFF_KIND),
+            ).fetchone()
+        return row is not None
 
     def append_audit(self, action: str, entity_type: str, entity_id: int,
                      actor: str, detail: dict) -> Dict[str, Any]:
